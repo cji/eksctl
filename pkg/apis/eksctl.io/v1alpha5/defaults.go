@@ -1,5 +1,24 @@
 package v1alpha5
 
+// SupportedCloudWatchClusterLoggingTypes retuls all supported logging facilities
+func SupportedCloudWatchClusterLoggingTypes() []string {
+	return []string{"api", "audit", "authenticator", "controllerManager", "scheduler"}
+}
+
+// SetClusterConfigDefaults will set defaults for a given cluster
+func SetClusterConfigDefaults(cfg *ClusterConfig) error {
+	if cfg.CloudWatch != nil && cfg.CloudWatch.ClusterLogging != nil {
+		for _, logType := range cfg.CloudWatch.ClusterLogging.EnableTypes {
+			switch logType {
+			case "all", "*":
+				cfg.CloudWatch.ClusterLogging.EnableTypes = SupportedCloudWatchClusterLoggingTypes()
+			}
+		}
+	}
+
+	return nil
+}
+
 // SetNodeGroupDefaults will set defaults for a given nodegroup
 func SetNodeGroupDefaults(_ int, ng *NodeGroup) error {
 	if ng.InstanceType == "" {

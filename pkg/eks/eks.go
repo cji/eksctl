@@ -10,6 +10,7 @@ import (
 	"github.com/kris-nova/logger"
 	"github.com/pkg/errors"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/request"
 	awseks "github.com/aws/aws-sdk-go/service/eks"
 
@@ -17,6 +18,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
+	"github.com/weaveworks/eksctl/pkg/cfn/manager"
 	"github.com/weaveworks/eksctl/pkg/printers"
 	"github.com/weaveworks/eksctl/pkg/utils/waiters"
 	"github.com/weaveworks/eksctl/pkg/vpc"
@@ -228,18 +230,124 @@ func (c *ClusterProvider) WaitForControlPlane(id *api.ClusterMeta, clientSet *ku
 	}
 }
 
+type updateClusterConfigTask struct {
+	info string
+	spec *api.ClusterConfig
+	call func(*api.ClusterConfig) error
+}
+
+func (t *updateClusterConfigTask) Describe() string { return t.info }
+func (t *updateClusterConfigTask) Do(errs chan error) error {
+	err := t.call(t.spec)
+	close(errs)
+	return err
+}
+
+// GetCurrentClusterConfigForLogging fetches current cluster logging configuration as two sets - dsiable and enanaled types
+func (c *ClusterProvider) GetCurrentClusterConfigForLogging(cl *api.ClusterMeta) (sets.String, sets.String, error) {
+	enabled := sets.NewString()
+	disabled := sets.NewString()
+
+	cluster, err := c.DescribeControlPlaneMustBeActive(cl)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "unable to retrieve current cluster logging configuration")
+	}
+
+	for _, i := range cluster.Logging.ClusterLogging {
+		for _, t := range i.Types {
+			if t == nil {
+				return nil, nil, fmt.Errorf("unexpected response from EKS API - nil string")
+			}
+			if api.IsEnabled(i.Enabled) {
+				enabled.Insert(*t)
+			}
+			if api.IsDisabled(i.Enabled) {
+				disabled.Insert(*t)
+			}
+		}
+	}
+	return enabled, disabled, nil
+}
+
+// UpdateClusterConfigForLogging calls UpdateClusterConfig to enable logging
+func (c *ClusterProvider) UpdateClusterConfigForLogging(cfg *api.ClusterConfig) error {
+	enabled := sets.NewString()
+	disabled := sets.NewString()
+	if cfg.CloudWatch != nil && cfg.CloudWatch.ClusterLogging != nil {
+		enabled.Insert(cfg.CloudWatch.ClusterLogging.EnableTypes...)
+	}
+
+	for _, logType := range api.SupportedCloudWatchClusterLoggingTypes() {
+		if !enabled.Has(logType) {
+			disabled.Insert((logType))
+		}
+	}
+
+	input := &awseks.UpdateClusterConfigInput{
+		Name: &cfg.Metadata.Name,
+		Logging: &awseks.Logging{
+			ClusterLogging: []*awseks.LogSetup{
+				{
+					Enabled: api.Enabled(),
+					Types:   aws.StringSlice(enabled.List()),
+				},
+				{
+					Enabled: api.Disabled(),
+					Types:   aws.StringSlice(disabled.List()),
+				},
+			},
+		},
+	}
+
+	output, err := c.Provider.EKS().UpdateClusterConfig(input)
+	if err != nil {
+		return err
+	}
+	if err := c.waitForUpdateToSucceed(cfg.Metadata.Name, output.Update); err != nil {
+		return err
+	}
+
+	describeEnabledTypes := "no types enabled"
+	if len(enabled.List()) > 0 {
+		describeEnabledTypes = fmt.Sprintf("enabled types: %s", strings.Join(enabled.List(), ", "))
+	}
+
+	describeDisabledTypes := "no types disabled"
+	if len(disabled.List()) > 0 {
+		describeDisabledTypes = fmt.Sprintf("disabled types: %s", strings.Join(disabled.List(), ", "))
+	}
+
+	logger.Success("configured CloudWatch logging for cluster %q in %q (%s & %s)",
+		cfg.Metadata.Name, cfg.Metadata.Region, describeEnabledTypes, describeDisabledTypes,
+	)
+	return nil
+}
+
+// UpdateClusterConfigTasks returns all tasks for updating cluster configuration
+func (c *ClusterProvider) UpdateClusterConfigTasks(cfg *api.ClusterConfig) *manager.TaskTree {
+	tasks := &manager.TaskTree{Parallel: false}
+
+	tasks.Append(&updateClusterConfigTask{
+		info: "update CloudWatch logging configurtaion",
+		spec: cfg,
+		call: c.UpdateClusterConfigForLogging,
+	})
+
+	return tasks
+}
+
 // UpdateClusterVersion calls eks.UpdateClusterVersion and updates to cfg.Metadata.Version,
 // it will return update ID along with an error (if it occurrs)
-func (c *ClusterProvider) UpdateClusterVersion(cfg *api.ClusterConfig) (string, error) {
+func (c *ClusterProvider) UpdateClusterVersion(cfg *api.ClusterConfig) (*awseks.Update, error) {
 	input := &awseks.UpdateClusterVersionInput{
 		Name:    &cfg.Metadata.Name,
 		Version: &cfg.Metadata.Version,
 	}
 	output, err := c.Provider.EKS().UpdateClusterVersion(input)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return *output.Update.Id, nil
+	return output.Update, nil
 }
 
 // UpdateClusterVersionBlocking calls UpdateClusterVersion and blocks until update
@@ -250,16 +358,18 @@ func (c *ClusterProvider) UpdateClusterVersionBlocking(cfg *api.ClusterConfig) e
 		return err
 	}
 
+	return c.waitForUpdateToSucceed(cfg.Metadata.Name, id)
+}
+
+func (c *ClusterProvider) waitForUpdateToSucceed(clusterName string, update *awseks.Update) error {
 	newRequest := func() *request.Request {
 		input := &awseks.DescribeUpdateInput{
-			Name:     &cfg.Metadata.Name,
-			UpdateId: &id,
+			Name:     &clusterName,
+			UpdateId: update.Id,
 		}
 		req, _ := c.Provider.EKS().DescribeUpdateRequest(input)
 		return req
 	}
-
-	msg := fmt.Sprintf("waiting for control plane %q version update", cfg.Metadata.Name)
 
 	acceptors := waiters.MakeAcceptors(
 		"Update.Status",
@@ -270,7 +380,9 @@ func (c *ClusterProvider) UpdateClusterVersionBlocking(cfg *api.ClusterConfig) e
 		},
 	)
 
-	return waiters.Wait(cfg.Metadata.Name, msg, acceptors, newRequest, c.Provider.WaitTimeout(), nil)
+	msg := fmt.Sprintf("waiting for requested %q in cluster %q to succeed", *update.Type, clusterName)
+
+	return waiters.Wait(clusterName, msg, acceptors, newRequest, c.Provider.WaitTimeout(), nil)
 }
 
 func addSummaryTableColumns(printer *printers.TablePrinter) {

@@ -119,7 +119,7 @@ var _ = Describe("eksctl API", func() {
 		It("should pick a valid AMI for normal instances when AMI is static", func() {
 			ng.AMI = "static"
 			ng.InstanceType = "m5.xlarge"
-
+ 
 			err := ctl.EnsureAMI("1.12", ng)
 
 			Expect(err).ToNot(HaveOccurred())
